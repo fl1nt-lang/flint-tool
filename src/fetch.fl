@@ -1,0 +1,109 @@
+// fetch - dependencies that are downloaded: `name = { url = "...", sha256 = "..." }`.
+//
+// The archive (anything `tar` unpacks) is downloaded with `curl`, checked against the sha256 in
+// flint.toml, and unpacked once into a cache shared by every package:
+//
+//   $FLINT_CACHE/deps/<sha256>/     (FLINT_CACHE: ~/.cache/flint by default)
+//
+// The hash names the directory, so the same archive is never downloaded twice, and a
+// dependency that's in the cache needs no network. The package is the archive's top, or the one
+// directory at its top (what a release tarball usually has).
+
+import std.fs;
+import std.heap;
+import std.process;
+import base.text;
+import base.cmdline;
+import cache;
+import sha256;
+
+extern fn rename(from: cstr, to: cstr) -> i32;
+extern fn getpid() -> i32;
+
+// what was asked for, or why there's none (err isn't empty)
+pub struct Got {
+    value: []const u8,
+    err: []const u8,
+}
+
+fn ok(value: []const u8) -> Got { return Got { value: value, err: "" }; }
+fn no(err: []const u8) -> Got { return Got { value: "", err: err }; }
+
+// the cache's deps directory, created
+fn depsDir() -> ?[]const u8 {
+    var root: []const u8 = "";
+    if (process.getEnv("FLINT_CACHE")) |c| { root = c; }
+    if (root.len == 0) {
+        let home = process.getEnv("HOME") orelse return null;
+        root = text.f("{s}/.cache/flint", .{home});
+    }
+    let deps = text.f("{s}/deps", .{root});
+    return if (cache.makeDirs(deps)) deps else null;
+}
+
+fn validHash(s: []const u8) -> bool {
+    if (s.len != 64) { return false; }
+    for (s) |c| {
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) { return false; }
+    }
+    return true;
+}
+
+// downloads url to a file and returns the file's sha256
+fn download(url: []const u8, to: []const u8) -> Got {
+    if (cmdline.run(&[_][]const u8 { "curl", "-fsSL", url, "-o", to }) != 0) {
+        return no(text.f("can't download {s}", .{url}));
+    }
+    let bytes = fs.readFile(heap.c_allocator, to) catch return no(text.f("can't read what was downloaded from {s}", .{url}));
+    return ok(sha256.hex(bytes));
+}
+
+// The sha256 of what's at url: what to write in flint.toml for a dependency that has no hash yet.
+pub fn hashOf(url: []const u8) -> Got {
+    let deps = depsDir() orelse return no("there's no cache directory: set FLINT_CACHE (or HOME)");
+    let archive = text.f("{s}/probe{}.archive", .{deps, getpid()});
+    let got = download(url, archive);
+    fs.remove(archive) catch {};
+    return got;
+}
+
+// The directory of the package at url, downloading it unless it's in the cache already.
+pub fn get(url: []const u8, sha: []const u8) -> Got {
+    if (!validHash(sha)) { return no("sha256 must be the archive's SHA-256: 64 lowercase hex digits"); }
+    let deps = depsDir() orelse return no("there's no cache directory: set FLINT_CACHE (or HOME)");
+    let dest = text.f("{s}/{s}", .{deps, sha});
+    if (fs.exists(text.f("{s}/flint.toml", .{dest}))) { return ok(dest); }
+    // unpacked next to where it goes, then moved there: another flint may be doing the same
+    let stage = text.f("{s}/{s}.tmp{}", .{deps, sha, getpid()});
+    let archive = text.f("{s}.archive", .{stage});
+    cache.removeTree(stage);
+    let got = unpack(url, sha, stage, archive, dest);
+    cache.removeTree(stage);
+    fs.remove(archive) catch {};
+    return got;
+}
+
+fn unpack(url: []const u8, sha: []const u8, stage: []const u8, archive: []const u8, dest: []const u8) -> Got {
+    let got = download(url, archive);
+    if (got.err.len > 0) { return got; }
+    if (!text.eq(got.value, sha)) {
+        return no(text.f("{s} has the sha256 {s}, not the one given here: it isn't the archive this package was written against", .{url, got.value}));
+    }
+    fs.makeDir(stage) catch return no(text.f("can't create {s}", .{stage}));
+    if (cmdline.run(&[_][]const u8 { "tar", "-xf", archive, "-C", stage }) != 0) {
+        return no(text.f("can't unpack {s} (it must be an archive that 'tar' reads)", .{url}));
+    }
+    var top = stage;
+    if (!fs.exists(text.f("{s}/flint.toml", .{top}))) {
+        let names = cache.list(stage);
+        if (names.len == 1) { top = text.f("{s}/{s}", .{stage, names[0]}); }
+        if (!fs.exists(text.f("{s}/flint.toml", .{top}))) {
+            return no(text.f("{s} isn't a Flint package: there's no flint.toml at its top", .{url}));
+        }
+    }
+    if (!fs.exists(text.f("{s}/flint.toml", .{dest}))) { cache.removeTree(dest); } // what an interrupted flint left
+    if (rename(text.z(top), text.z(dest)) != 0 && !fs.exists(text.f("{s}/flint.toml", .{dest}))) {
+        return no(text.f("can't create {s}", .{dest}));
+    }
+    return ok(dest);
+}

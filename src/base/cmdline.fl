@@ -1,0 +1,75 @@
+// base.cmdline - what a command-line program needs around its work: its name in front of its
+// messages, errors that say what to do instead, a guess at what a typo meant, and running other
+// programs.
+
+import std.io;
+import std.heap;
+import std.process;
+import base.term;
+
+// the program's name, as its messages show it
+pub var prog: []const u8 = "flint";
+
+// "<prog>: error: msg", and a hint line if there's one
+pub fn complain(msg: []const u8, hint: []const u8) {
+    _ = io.flush() catch {};
+    _ = io.eprint("{s}: {s}: {s}\n", .{prog, term.label("error"), msg}) catch {};
+    if (hint.len > 0) { _ = io.eprint("  {s}: {s}\n", .{term.label("hint"), hint}) catch {}; }
+}
+
+// The command line is wrong: says what, and what to do about it. Ends the program with status 2.
+pub fn die(msg: []const u8, hint: []const u8) -> noreturn {
+    complain(msg, hint);
+    exit(2);
+}
+
+// Something went wrong while doing the work: the message, and the exit status 1 to return.
+pub fn fail(msg: []const u8, hint: []const u8) -> u8 {
+    complain(msg, hint);
+    return 1;
+}
+
+fn min3(a: usize, b: usize, c: usize) -> usize {
+    let m = if (a < b) a else b;
+    return if (m < c) m else c;
+}
+
+// how many single-character edits turn a into b (99 for words too long to be worth comparing)
+fn distance(a: []const u8, b: []const u8) -> usize {
+    var prev: [32]usize = undefined;
+    var cur: [32]usize = undefined;
+    if (a.len >= 32 || b.len >= 32) { return 99; }
+    for (0..b.len + 1) |j| { prev[j] = j; }
+    for (0..a.len) |i| {
+        cur[0] = i + 1;
+        for (0..b.len) |j| {
+            let change: usize = if (a[i] == b[j]) 0 else 1;
+            cur[j + 1] = min3(prev[j + 1] + 1, cur[j] + 1, prev[j] + change);
+        }
+        for (0..b.len + 1) |j| { prev[j] = cur[j]; }
+    }
+    return prev[b.len];
+}
+
+// the candidate closest to `word`, when it's close enough to be a typo of it
+pub fn closest(word: []const u8, candidates: []const []const u8) -> ?[]const u8 {
+    var best: ?[]const u8 = null;
+    var best_d: usize = 3; // at most two edits away
+    for (candidates) |c| {
+        let d = distance(word, c);
+        if (d < best_d && d < c.len) {
+            best = c;
+            best_d = d;
+        }
+    }
+    return best;
+}
+
+// runs argv and returns its exit status (128 + the signal if it was killed; 127 if it couldn't start)
+pub fn run(argv: []const []const u8) -> u8 {
+    _ = io.flush() catch {};
+    return process.run(heap.c_allocator, argv) catch {
+        _ = io.eprint("{s}: {s}: can't run {s}\n", .{prog, term.label("error"), argv[0]}) catch {};
+        return 127;
+    };
+}

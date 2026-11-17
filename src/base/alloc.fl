@@ -1,0 +1,80 @@
+// base.alloc - the compiler's memory: zeroed objects and growable arrays from the C heap.
+//
+// flint is a short-lived process, so it follows one simple policy: memory is never freed,
+// and running out of it ends the compile with a message. That's why nothing here returns an
+// error: allocation is still explicit (every call is visible), it just can't fail quietly.
+
+import std.io;
+import std.mem;
+
+extern fn calloc(n: usize, size: usize) -> ?[*]u8;
+extern fn realloc(p: ?[*]u8, n: usize) -> ?[*]u8;
+extern fn memcpy(dst: [*]u8, src: [*]const u8, n: usize) -> [*]u8;
+
+pub fn oom() -> noreturn {
+    _ = io.flush() catch {};
+    _ = io.eprint("out of memory\n", .{}) catch {};
+    exit(1);
+}
+
+fn bytes(n: usize) -> [*]u8 {
+    return calloc(1, if (n == 0) 1 else n) orelse oom();
+}
+
+// One zeroed T.
+pub fn new(comptime T: type) -> *T {
+    unsafe { return @ptrCast(*T, bytes(@sizeOf(T))); }
+}
+
+// n zeroed Ts.
+pub fn make(comptime T: type, n: usize) -> []T {
+    unsafe { return @ptrCast([*]T, bytes(n * @sizeOf(T)))[0..n]; }
+}
+
+// A copy of s.
+pub fn dupe(comptime T: type, s: []const T) -> []T {
+    let out = make(T, s.len);
+    for (0..s.len) |i| { out[i] = s[i]; }
+    return out;
+}
+
+// A growable array. A zeroed Vec is a valid empty one, so it can live in zeroed structs.
+//
+//   var xs: Vec(i32) = .{};
+//   xs.push(5);
+//   for (xs.items) |x| { ... }
+pub fn Vec(comptime T: type) -> type {
+    return struct {
+        items: []T = mem.Allocator.empty(T),
+        cap: usize = 0,
+
+        pub fn push(self: *Self, x: T) {
+            let n = self.items.len;
+            if (n == self.cap) {
+                let nc = if (self.cap == 0) 8 else self.cap * 2;
+                var old: ?[*]u8 = null;
+                if (self.cap != 0) {
+                    unsafe { old = @ptrCast([*]u8, self.items.ptr); }
+                }
+                let p = realloc(old, nc * @sizeOf(T)) orelse oom();
+                unsafe { self.items = @ptrCast([*]T, p)[0..n]; }
+                self.cap = nc;
+            }
+            unsafe { self.items = self.items.ptr[0..n + 1]; }
+            self.items[n] = x;
+        }
+
+        pub fn len(self: *const Self) -> usize { return self.items.len; }
+
+        // the last element (there must be one)
+        pub fn last(self: *const Self) -> T { return self.items[self.items.len - 1]; }
+
+        pub fn pop(self: *Self) -> T {
+            let x = self.items[self.items.len - 1];
+            self.items = self.items[0..self.items.len - 1];
+            return x;
+        }
+
+        pub fn truncate(self: *Self, n: usize) { self.items = self.items[0..n]; }
+    };
+}

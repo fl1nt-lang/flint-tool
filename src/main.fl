@@ -1,0 +1,26 @@
+// The `flint` command: the project tool. A project is a directory with a flint.toml; flint
+// creates one, downloads what it depends on, and builds, runs and tests it by calling the
+// compiler, `flintc`, which knows nothing of all that.
+//
+//   cli.fl       the command line
+//   project.fl   flint.toml: the package, its dependencies and profiles (toml.fl reads the file)
+//   fetch.fl     dependencies that are downloaded (sha256.fl checks them)
+//   build.fl     the build: the C sources, then flintc with the options for this project
+//   scaffold.fl  init, fetch and clean
+//
+//   cache.fl     a project's out/ directory, and when what's in it can be used again
+//   base/        memory, strings, terminal colors, command-line errors
+//
+// flint uses flintc only through its command line (see build.fl), so the two are built and
+// released on their own.
+
+import std.io;
+import base.cmdline;
+import cli;
+
+fn main() -> u8 {
+    cmdline.prog = "flint";
+    let status = cli.main(args());
+    _ = io.flush() catch {};
+    return status;
+}

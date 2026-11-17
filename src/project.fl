@@ -1,0 +1,294 @@
+// project - flint.toml, the manifest of a project (a package), and the packages it leads to
+//
+//   [package]
+//   name = "app"
+//   version = "0.1.0"
+//   root = "src/main.fl"            # the default
+//
+//   [dependencies]
+//   geometry = { path = "../geometry" }
+//   json = { url = "https://example.com/json-1.2.0.tar.gz", sha256 = "9f2c..." }
+//
+//   [c]                             # C code in the package, built with the C compiler
+//   sources = ["c/fast.c"]
+//   include = ["c"]
+//   flags = ["-Wall"]
+//   link = ["m"]                    # -lm
+//
+//   [profile.release]               # build settings, picked with --release or --profile=<name>
+//   optimize = true                 # -O2 (the default in 'release' only)
+//   overflow = "wrap"               # or "trap", the default
+//   c-flags = ["-march=native"]     # added to every package's C flags
+//
+// 'debug' and 'release' exist without being written; a [profile.<name>] changes one of them or
+// makes a new one. Only the profiles of the package being built count, not its dependencies'.
+// The file's syntax is toml.fl's; a downloaded dependency is fetch.fl's. None of this reaches the
+// compiler: build.fl turns it into flintc's options.
+
+import std.io;
+import std.fs;
+import std.heap;
+import base.alloc;
+import base.text;
+import base.term;
+import cache;
+import toml;
+import fetch;
+
+// named build settings: [profile.<name>], picked with --profile (or --release)
+pub struct Profile {
+    name: []const u8,
+    optimize: bool,                // -O2
+    wrap: bool,                    // --overflow=wrap
+    cflags: alloc.Vec([]const u8), // more flags for the C compiler
+}
+
+// a package's dependency, by the name the package uses for it
+pub struct Dep {
+    name: []const u8,
+    pkg: *Package,
+}
+
+// a package: a directory with a flint.toml
+pub struct Package {
+    name: []const u8,
+    version: []const u8,
+    dir: []const u8,     // the manifest's directory
+    root: []const u8,    // the root source file
+    deps: alloc.Vec(Dep),
+    profiles: alloc.Vec(Profile),
+    csrc: alloc.Vec([]const u8),
+    cinc: alloc.Vec([]const u8),
+    cflags: alloc.Vec([]const u8),
+    clink: alloc.Vec([]const u8),
+}
+
+fn joinPath(dir: []const u8, p: []const u8) -> []const u8 {
+    if (p.len > 0 && p[0] == '/') { return p; }
+    return text.f("{s}/{s}", .{dir, p});
+}
+
+fn real(p: []const u8) -> []const u8 { return cache.real(p); }
+
+var loaded: alloc.Vec(*Package) = @zeroes(alloc.Vec(*Package));
+
+// one flint.toml being read
+struct Reader {
+    file: []const u8,
+    dir: []const u8,
+    pkg: *Package,
+    root: []const u8, // [package] root ("" if it isn't set)
+}
+
+fn str(r: *Reader, e: *toml.Entry) -> []const u8 {
+    if (e.v.k != .Str) { toml.bad(r.file, e.line, text.f("'{s}' must be a string", .{e.key})); }
+    return e.v.s;
+}
+
+fn strList(r: *Reader, e: *toml.Entry) -> []const []const u8 {
+    if (e.v.k != .Arr) { toml.bad(r.file, e.line, text.f("'{s}' must be an array of strings", .{e.key})); }
+    return e.v.arr.items;
+}
+
+fn package(r: *Reader, e: *toml.Entry) {
+    if (text.eq(e.key, "name")) {
+        r.pkg.name = str(r, e);
+    } else if (text.eq(e.key, "root")) {
+        r.root = str(r, e);
+    } else if (text.eq(e.key, "version")) {
+        r.pkg.version = str(r, e);
+    } else if (text.eq(e.key, "description")) {
+        _ = str(r, e);
+    } else {
+        toml.bad(r.file, e.line, text.f("unknown key '{s}' in [package] (name, root, version, description)", .{e.key}));
+    }
+}
+
+// a downloaded dependency's directory
+fn remote(r: *Reader, e: *toml.Entry, url: []const u8) -> []const u8 {
+    let k = e.key;
+    let sha = toml.get(e.v, "sha256") orelse {
+        let h = fetch.hashOf(url);
+        if (h.err.len > 0) { toml.bad(r.file, e.line, text.f("dependency '{s}': {s}", .{k, h.err})); }
+        toml.bad(r.file, e.line, text.f("dependency '{s}' needs the sha256 of its archive, so that it can't change unnoticed; what's at the url now has: sha256 = \"{s}\"", .{k, h.value}));
+    };
+    let got = fetch.get(url, sha);
+    if (got.err.len > 0) { toml.bad(r.file, e.line, text.f("dependency '{s}': {s}", .{k, got.err})); }
+    return got.value;
+}
+
+fn dependency(r: *Reader, e: *toml.Entry) {
+    let k = e.key;
+    let v = e.v;
+    if (v.k != .Table) {
+        toml.bad(r.file, e.line, text.f("a dependency is an inline table: {s} = {{ path = \"../{s}\" }}, or {{ url = \"...\", sha256 = \"...\" }}", .{k, k}));
+    }
+    for (v.keys.items) |dk| {
+        if (!text.eq(dk, "path") && !text.eq(dk, "url") && !text.eq(dk, "sha256")) {
+            toml.bad(r.file, e.line, text.f("unknown key '{s}' in dependency '{s}' (path, or url and sha256)", .{dk, k}));
+        }
+    }
+    for (r.pkg.deps.items) |*d| {
+        if (text.eq(d.name, k)) { toml.bad(r.file, e.line, text.f("dependency '{s}' is listed twice", .{k})); }
+    }
+    if (text.eq(k, "std")) { toml.bad(r.file, e.line, "'std' is the standard library's name; pick another name for this dependency"); }
+    let path = toml.get(v, "path");
+    let url = toml.get(v, "url");
+    var ddir: []const u8 = "";
+    if (url) |u| {
+        if (path != null) { toml.bad(r.file, e.line, text.f("dependency '{s}' has a path and a url; it's one or the other", .{k})); }
+        ddir = remote(r, e, u);
+    } else if (path) |p| {
+        if (toml.get(v, "sha256") != null) { toml.bad(r.file, e.line, text.f("dependency '{s}': sha256 goes with a url, not with a path", .{k})); }
+        ddir = joinPath(r.dir, p);
+    } else {
+        toml.bad(r.file, e.line, text.f("dependency '{s}' needs a path or a url: {s} = {{ path = \"../{s}\" }}", .{k, k, k}));
+    }
+    var probe: [1024]u8 = undefined;
+    let ok = if (fs.realPath(ddir, probe[..])) |rp| fs.exists(text.f("{s}/flint.toml", .{rp})) else |_| false;
+    if (!ok) { toml.bad(r.file, e.line, text.f("dependency '{s}': no flint.toml in {s}", .{k, ddir})); }
+    r.pkg.deps.push(Dep { name: k, pkg: read(ddir) });
+}
+
+fn cTable(r: *Reader, e: *toml.Entry) {
+    let k = e.key;
+    let list = strList(r, e);
+    let paths = text.eq(k, "sources") || text.eq(k, "include");
+    var out: alloc.Vec([]const u8) = .{};
+    for (list) |s| { out.push(if (paths) joinPath(r.dir, s) else s); }
+    if (text.eq(k, "sources")) {
+        r.pkg.csrc = out;
+    } else if (text.eq(k, "include")) {
+        r.pkg.cinc = out;
+    } else if (text.eq(k, "flags")) {
+        r.pkg.cflags = out;
+    } else if (text.eq(k, "link")) {
+        r.pkg.clink = out;
+    } else {
+        toml.bad(r.file, e.line, text.f("unknown key '{s}' in [c] (sources, include, flags, link)", .{k}));
+    }
+}
+
+// what a profile is before its table changes it
+fn defaults(name: []const u8) -> Profile {
+    var p: Profile = @zeroes(Profile);
+    p.name = name;
+    p.optimize = text.eq(name, "release");
+    return p;
+}
+
+fn profileTable(r: *Reader, tb: *toml.Table) {
+    let name = tb.name[8..]; // after "profile."
+    if (text.indexOf(name, '.') != null) {
+        toml.bad(r.file, tb.line, text.f("a profile's table is [profile.<name>], not [{s}]", .{tb.name}));
+    }
+    var p = defaults(name);
+    for (tb.entries.items) |*e| {
+        if (text.eq(e.key, "optimize")) {
+            if (e.v.k != .Bool) { toml.bad(r.file, e.line, "'optimize' must be true or false"); }
+            p.optimize = e.v.i != 0;
+        } else if (text.eq(e.key, "overflow")) {
+            let m = str(r, e);
+            if (!text.eq(m, "trap") && !text.eq(m, "wrap")) {
+                toml.bad(r.file, e.line, text.f("unknown overflow mode \"{s}\": it's \"trap\" or \"wrap\"", .{m}));
+            }
+            p.wrap = text.eq(m, "wrap");
+        } else if (text.eq(e.key, "c-flags")) {
+            for (strList(r, e)) |fl| { p.cflags.push(fl); }
+        } else {
+            toml.bad(r.file, e.line, text.f("unknown key '{s}' in [{s}] (optimize, overflow, c-flags)", .{e.key, tb.name}));
+        }
+    }
+    r.pkg.profiles.push(p);
+}
+
+pub fn read(dir0: []const u8) -> *Package {
+    let dir = real(dir0);
+    for (loaded.items) |l| { if (text.eq(l.dir, dir)) { return l; } }
+    let file = text.f("{s}/flint.toml", .{dir});
+    let src = fs.readFile(heap.c_allocator, file) catch {
+        _ = io.eprint("flint: {s}: can't read {s}\n", .{term.label("error"), file}) catch {};
+        exit(1);
+    };
+    let pkg = alloc.new(Package);
+    pkg.dir = dir;
+    loaded.push(pkg);
+    let doc = toml.parse(file, src);
+    var reader = Reader { file: file, dir: dir, pkg: pkg, root: "" };
+    let r = &reader;
+    for (doc.tables.items) |tb| {
+        if (text.startsWith(tb.name, "profile.")) {
+            profileTable(r, tb);
+        } else if (text.eq(tb.name, "profile")) {
+            toml.bad(file, tb.line, "a profile has a name: [profile.release]");
+        } else if (text.eq(tb.name, "package")) {
+            for (tb.entries.items) |*e| { package(r, e); }
+        } else if (text.eq(tb.name, "dependencies")) {
+            for (tb.entries.items) |*e| { dependency(r, e); }
+        } else if (text.eq(tb.name, "c")) {
+            for (tb.entries.items) |*e| { cTable(r, e); }
+        } else {
+            toml.bad(file, tb.line, text.f("unknown table [{s}] (flint.toml has [package], [dependencies], [c] and [profile.<name>])", .{tb.name}));
+        }
+    }
+    if (pkg.name.len == 0) { toml.bad(file, 1, "the [package] table needs a name: name = \"...\""); }
+    pkg.root = joinPath(dir, if (r.root.len > 0) r.root else "src/main.fl");
+    if (!fs.exists(pkg.root)) {
+        toml.bad(file, 1, text.f("the package's root file {s} doesn't exist (set root = \"...\" in [package])", .{pkg.root}));
+    }
+    return pkg;
+}
+
+// The package's profile with this name: one of its [profile.<name>] tables, or the built-in
+// 'debug' or 'release'.
+pub fn profile(pkg: *Package, name: []const u8) -> ?*Profile {
+    for (pkg.profiles.items) |*p| { if (text.eq(p.name, name)) { return p; } }
+    if (!text.eq(name, "debug") && !text.eq(name, "release")) { return null; }
+    let p = alloc.new(Profile);
+    p.* = defaults(name);
+    return p;
+}
+
+// "debug, release, bench": the names profile() knows for this package
+pub fn profileNames(pkg: *Package) -> []const u8 {
+    var out: text.Buf = .{};
+    out.add("debug, release");
+    for (pkg.profiles.items) |*p| {
+        if (!text.eq(p.name, "debug") && !text.eq(p.name, "release")) { out.addf(", {s}", .{p.name}); }
+    }
+    return out.items;
+}
+
+// the nearest directory at or above `start` that holds a flint.toml
+pub fn find(start: []const u8) -> ?[]const u8 {
+    var d = start;
+    while (true) {
+        if (fs.exists(text.f("{s}/flint.toml", .{d}))) { return d; }
+        let slash = text.lastIndexOf(d, '/') orelse return null;
+        if (slash == 0) { return null; }
+        d = d[0..slash];
+    }
+}
+
+// The package and every package it leads to, each once, itself first. Two different packages
+// with one name can't be in a build: the name is what their modules are called by.
+pub fn all(root: *Package) -> []const *Package {
+    var out: alloc.Vec(*Package) = .{};
+    collect(root, &out);
+    for (0..out.items.len) |i| {
+        for (0..i) |j| {
+            if (text.eq(out.items[i].name, out.items[j].name)) {
+                _ = io.flush() catch {};
+                _ = io.eprint("flint: {s}: two packages are named '{s}': {s} and {s}\n", .{term.label("error"), out.items[i].name, out.items[j].dir, out.items[i].dir}) catch {};
+                exit(1);
+            }
+        }
+    }
+    return out.items;
+}
+
+fn collect(p: *Package, out: *alloc.Vec(*Package)) {
+    for (out.items) |x| { if (x == p) { return; } }
+    out.push(p);
+    for (p.deps.items) |*d| { collect(d.pkg, out); }
+}

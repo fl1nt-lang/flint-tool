@@ -1,0 +1,6 @@
+# flint builds itself: `flint build --release` here makes out/release/flint.
+# Without a flint yet, ./build.sh does the same with flintc alone.
+[package]
+name = "flint"
+version = "0.7.0"
+root = "src/main.fl"

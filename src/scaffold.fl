@@ -1,0 +1,98 @@
+// scaffold - the commands that manage a package's files rather than compile it:
+// `flint init` starts one, `flint fetch` downloads its dependencies, `flint clean` removes what
+// was built.
+
+import std.io;
+import std.fs;
+import base.alloc;
+import base.text;
+import base.term;
+import base.cmdline;
+import cache;
+import project;
+
+let MAIN: []const u8 = "import std.io;\nimport std.testing;\n\nfn greeting() -> []const u8 { return \"Hello from Flint!\"; }\n\nfn main() -> !void {\n    try io.print(\"{s}\\n\", .{greeting()});\n}\n\ntest \"greeting\" {\n    try testing.expectEqualStrings(\"Hello from Flint!\", greeting());\n}\n";
+
+fn fail(msg: []const u8, hint: []const u8) -> u8 { return cmdline.fail(msg, hint); }
+
+// a package's name is also its executable's: letters, digits, '_' and '-'
+fn validName(name: []const u8) -> bool {
+    if (name.len == 0) { return false; }
+    for (name) |c| {
+        let ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-';
+        if (!ok) { return false; }
+    }
+    return true;
+}
+
+fn create(path: []const u8, shown: []const u8, bytes: []const u8) -> bool {
+    fs.writeFile(path, bytes) catch {
+        _ = fail(text.f("can't write {s}", .{shown}), "");
+        return false;
+    };
+    _ = io.print("  {s} {s}\n", .{term.green(term.OUT, "created"), shown}) catch {};
+    return true;
+}
+
+// flint init [name]: flint.toml and src/main.fl, in a new directory `name` or (without a name)
+// in the current one, which then gives the package its name.
+pub fn init(name_arg: []const u8) -> u8 {
+    var cbuf: [1024]u8 = undefined;
+    let cwd = alloc.dupe(u8, fs.cwd(cbuf[..]) catch return fail("can't find the current directory", ""));
+    var name = name_arg;
+    var dir = cwd;
+    var prefix: []const u8 = ""; // in front of the paths shown
+    if (name.len > 0) {
+        if (!validName(name)) {
+            return fail(text.f("'{s}' can't be a package name", .{name}), "use letters, digits, '_' and '-': flint init my-app");
+        }
+        dir = text.f("{s}/{s}", .{cwd, name});
+        prefix = text.f("{s}/", .{name});
+        if (fs.exists(dir)) {
+            return fail(text.f("'{s}' already exists", .{name}), text.f("to make it a package: cd {s} && flint init", .{name}));
+        }
+        fs.makeDir(dir) catch return fail(text.f("can't create the directory {s}", .{name}), "");
+    } else {
+        name = if (text.lastIndexOf(cwd, '/')) |s| cwd[s + 1..] else cwd;
+        if (!validName(name)) {
+            return fail(text.f("this directory's name, '{s}', can't be a package name", .{name}), "use letters, digits, '_' and '-': rename it, or give a name with 'flint init <name>'");
+        }
+    }
+    let toml = text.f("{s}/flint.toml", .{dir});
+    if (fs.exists(toml)) { return fail("this directory already has a flint.toml", "'flint run' runs the package that's here"); }
+    if (!create(toml, text.f("{s}flint.toml", .{prefix}), text.f("[package]\nname = \"{s}\"\nversion = \"0.1.0\"\n", .{name}))) { return 1; }
+    let src = text.f("{s}/src", .{dir});
+    let main_fl = text.f("{s}/main.fl", .{src});
+    if (!fs.exists(main_fl)) { // an existing program is left alone
+        fs.makeDir(src) catch {};
+        if (!create(main_fl, text.f("{s}src/main.fl", .{prefix}), MAIN)) { return 1; }
+    }
+    let ignore = text.f("{s}/.gitignore", .{dir});
+    if (!fs.exists(ignore)) {
+        if (!create(ignore, text.f("{s}.gitignore", .{prefix}), "out/\n")) { return 1; }
+    }
+    let cd = if (name_arg.len > 0) text.f("  cd {s}\n", .{name}) else "";
+    _ = io.print("\nPackage '{s}' is ready. Try it:\n{s}  flint run\n  flint test\n", .{name, cd}) catch {};
+    return 0;
+}
+
+// flint fetch: reading the manifest downloads what isn't in the cache yet (driver.fetch), for
+// this package's dependencies and for theirs.
+pub fn fetch() -> u8 {
+    var cbuf: [1024]u8 = undefined;
+    let cwd = fs.cwd(cbuf[..]) catch return fail("can't find the current directory", "");
+    let dir = project.find(alloc.dupe(u8, cwd)) orelse return fail(
+        "this directory isn't in a package", "'flint fetch' downloads a package's dependencies; there's no flint.toml here or above");
+    _ = project.read(dir);
+    return 0;
+}
+
+// flint clean: removes the package's out/ directory, which holds nothing but what flint built.
+pub fn clean() -> u8 {
+    var cbuf: [1024]u8 = undefined;
+    let cwd = fs.cwd(cbuf[..]) catch return fail("can't find the current directory", "");
+    let dir = project.find(alloc.dupe(u8, cwd)) orelse return fail(
+        "this directory isn't in a package", "'flint clean' removes a package's out/ directory; there's no flint.toml here or above");
+    cache.removeTree(cache.outDir(dir));
+    return 0;
+}

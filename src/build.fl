@@ -1,0 +1,171 @@
+// build - building a project. flint does what flint.toml asks for and flintc can't know about:
+// it compiles the packages' C sources (into the cache in out/, see cache.fl),
+// then calls flintc once, with the packages, objects, libraries and settings as options.
+//
+//   flintc build -O2 --overflow=wrap --pkg geometry=<root.fl> --dep geometry=geometry
+//       --include <dir> --object <c/x.o> --lib m --cache out/release/cache/main
+//       -o out/release/app src/main.fl
+//
+// `flint build --verbose` shows the commands.
+
+import std.io;
+import std.fs;
+import std.hash;
+import std.process;
+import base.alloc;
+import base.text;
+import base.cmdline;
+import cache;
+import project;
+
+extern fn setenv(name: cstr, value: cstr, overwrite: i32) -> i32;
+
+pub struct Plan {
+    pkg: *project.Package,
+    prof: *project.Profile,
+    tests: bool,          // the program that runs the `test` blocks, not the package's own
+    verbose: bool,        // show the commands
+    color: []const u8,    // "always", "never", or "" to let each program decide
+}
+
+// The compiler: $FLINTC, or the flintc next to this program, or the one in PATH.
+fn flintc() -> []const u8 {
+    if (process.getEnv("FLINTC")) |f| { if (f.len > 0) { return f; } }
+    var buf: [1024]u8 = undefined;
+    if (process.exePath(buf[..])) |me| {
+        let rp = cache.real(alloc.dupe(u8, me));
+        if (text.lastIndexOf(rp, '/')) |slash| {
+            let near = text.f("{s}/flintc", .{rp[0..slash]});
+            if (fs.exists(near)) { return near; }
+        }
+    } else |_| {}
+    return "flintc";
+}
+
+fn run(p: *Plan, argv: []const []const u8) -> u8 {
+    if (p.verbose) {
+        var line: text.Buf = .{};
+        for (argv) |a| { line.addf(" {s}", .{a}); }
+        _ = io.flush() catch {};
+        _ = io.eprint("  running:{s}\n", .{line.items}) catch {};
+    }
+    return cmdline.run(argv);
+}
+
+// `flintc <command>` with the profile's settings, and the packages this one leads to
+fn compilerCommand(p: *Plan, command: []const u8, pkgs: []const *project.Package) -> alloc.Vec([]const u8) {
+    var argv: alloc.Vec([]const u8) = .{};
+    argv.push(flintc());
+    argv.push(command);
+    argv.push(if (p.prof.optimize) "-O2" else "-O0");
+    argv.push(if (p.prof.wrap) "--overflow=wrap" else "--overflow=trap");
+    if (p.color.len > 0) { argv.push(text.f("--color={s}", .{p.color})); }
+    for (pkgs) |pk| {
+        if (pk == p.pkg) { continue; }
+        argv.push("--pkg");
+        argv.push(text.f("{s}={s}", .{pk.name, pk.root}));
+    }
+    for (pkgs) |pk| {
+        let scope = if (pk == p.pkg) "" else text.f("{s}:", .{pk.name});
+        for (pk.deps.items) |*d| {
+            argv.push("--dep");
+            argv.push(text.f("{s}{s}={s}", .{scope, d.name, d.pkg.name}));
+        }
+        for (pk.cinc.items) |inc| {
+            argv.push("--include");
+            argv.push(text.f("{s}{s}", .{scope, inc}));
+        }
+    }
+    return argv;
+}
+
+// One C source -> its object in dir, compiled unless the object there was made by the same
+// command from the same source and headers. null if the C compiler failed.
+fn compileC(p: *Plan, pk: *project.Package, src: []const u8, dir: []const u8) -> ?[]const u8 {
+    let stem = text.f("{s}/c/{s}-{s}", .{dir, pk.name, cache.hex(hash.bytes(src))});
+    let obj = text.f("{s}.o", .{stem});
+    let dfile = text.f("{s}.d", .{stem});
+    let kpath = text.f("{s}.key", .{stem});
+    var cc: alloc.Vec([]const u8) = .{};
+    cc.push("cc");
+    cc.push("-c");
+    cc.push(if (p.prof.optimize) "-O2" else "-O0");
+    for (pk.cinc.items) |inc| { cc.push(text.f("-I{s}", .{inc})); }
+    for (pk.cflags.items) |fl| { cc.push(fl); }
+    for (p.prof.cflags.items) |fl| { cc.push(fl); }
+    cc.push(src);
+    cc.push("-o");
+    cc.push(obj);
+    cc.push("-MMD"); // the headers it includes are written to dfile: they're part of its key
+    cc.push("-MF");
+    cc.push(dfile);
+    if (fs.exists(obj)) {
+        let now = cache.cKey(cc.items, dfile);
+        if (now.len > 0 && text.eq(cache.read(kpath), now)) { return obj; }
+    }
+    fs.remove(kpath) catch {};
+    if (run(p, cc.items) != 0) {
+        _ = cmdline.fail(text.f("compiling {s} failed", .{src}), "");
+        return null;
+    }
+    let key = cache.cKey(cc.items, dfile);
+    if (key.len > 0) { cache.write(kpath, key); }
+    return obj;
+}
+
+// flint check: compile errors only
+pub fn check(p: *Plan) -> u8 {
+    var argv = compilerCommand(p, "check", project.all(p.pkg));
+    argv.push(p.pkg.root);
+    return run(p, argv.items);
+}
+
+// what build() made (exe), or the exit status of what failed
+pub struct Built {
+    status: u8,
+    exe: []const u8,
+}
+
+// Builds out/<profile>/<name> (or <name>-test).
+pub fn build(p: *Plan) -> Built {
+    let pkgs = project.all(p.pkg);
+    let dir = cache.stepDir(p.pkg.dir, p.prof.name, if (p.tests) "test" else "main");
+    if (!cache.makeDirs(text.f("{s}/c", .{dir}))) {
+        return Built { status: cmdline.fail(text.f("can't create the directory {s}", .{dir}), ""), exe: "" };
+    }
+    let exe = text.f("{s}/{s}{s}", .{cache.profileDir(p.pkg.dir, p.prof.name), p.pkg.name, if (p.tests) "-test" else ""});
+    var argv = compilerCommand(p, "build", pkgs);
+    if (p.tests) {
+        argv.push("--test");
+        argv.push("--all-files");
+    }
+    for (pkgs) |pk| {
+        for (pk.csrc.items) |src| {
+            let obj = compileC(p, pk, src, dir) orelse return Built { status: 1, exe: "" };
+            argv.push("--object");
+            argv.push(obj);
+        }
+    }
+    for (pkgs) |pk| {
+        for (pk.clink.items) |l| {
+            argv.push("--lib");
+            argv.push(l);
+        }
+    }
+    argv.push("--cache");
+    argv.push(dir);
+    argv.push("-o");
+    argv.push(exe);
+    argv.push(p.pkg.root);
+    return Built { status: run(p, argv.items), exe: exe };
+}
+
+// runs what build() made; the program's exit status
+pub fn runExe(p: *Plan, exe: []const u8, prog_args: []const []const u8) -> u8 {
+    // the program's own colored output (the test report) follows --color too
+    if (p.color.len > 0) { _ = setenv(text.z("FLINT_COLOR"), text.z(p.color), 1); }
+    var argv: alloc.Vec([]const u8) = .{};
+    argv.push(exe);
+    for (prog_args) |a| { argv.push(a); }
+    return cmdline.run(argv.items);
+}

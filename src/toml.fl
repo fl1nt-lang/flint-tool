@@ -1,0 +1,230 @@
+// toml - the small subset of TOML that flint.toml is written in:
+//
+//   [table] and [table.name], key = value, where a value is a "string", an integer, true/false,
+//   an array of strings, or an inline table of strings; # starts a comment.
+//
+// parse() gives the tables in the file's order, each with its entries and their lines, so
+// project.fl can say where something is wrong.
+
+import std.io;
+import base.alloc;
+import base.text;
+import base.term;
+
+pub enum VKind { Str, Int, Bool, Arr, Table }
+
+pub struct Value {
+    k: VKind,
+    s: []const u8,
+    i: i64,
+    arr: alloc.Vec([]const u8),  // Arr: strings
+    keys: alloc.Vec([]const u8), // Table: key = "string" pairs
+    vals: alloc.Vec([]const u8),
+}
+
+pub struct Entry {
+    key: []const u8,
+    v: *Value,
+    line: i32,
+}
+
+pub struct Table {
+    name: []const u8, // "package", "profile.release"
+    line: i32,
+    entries: alloc.Vec(Entry),
+}
+
+pub struct Doc {
+    file: []const u8,
+    tables: alloc.Vec(*Table),
+}
+
+struct TP {
+    file: []const u8,
+    src: []const u8,
+    p: usize,
+    line: i32,
+
+    // the current byte (0 at the end)
+    fn c(self: *Self) -> u8 { return if (self.p < self.src.len) self.src[self.p] else 0; }
+}
+
+// An error in the file, at a line. Ends flint.
+pub fn bad(file: []const u8, line: i32, msg: []const u8) -> noreturn {
+    _ = io.flush() catch {};
+    _ = io.eprint("{s} {s}: {s}\n", .{term.bold(term.ERR, text.f("{s}:{}:", .{file, line})), term.label("error"), msg}) catch {};
+    exit(1);
+}
+
+fn err(t: *TP, msg: []const u8) -> noreturn { bad(t.file, t.line, msg); }
+
+fn isAlnum(c: u8) -> bool { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'); }
+
+fn skipWs(t: *TP) {
+    while (t.c() == ' ' || t.c() == '\t' || t.c() == '\r') { t.p += 1; }
+    if (t.c() == '#') {
+        while (t.c() != 0 && t.c() != '\n') { t.p += 1; }
+    }
+}
+
+// whitespace, comments and newlines (inside arrays and inline tables)
+fn skipAll(t: *TP) {
+    while (true) {
+        skipWs(t);
+        if (t.c() != '\n') { return; }
+        t.p += 1;
+        t.line += 1;
+    }
+}
+
+fn key(t: *TP) -> []const u8 {
+    let s = t.p;
+    while (t.c() != 0 && (isAlnum(t.c()) || t.c() == '_' || t.c() == '-')) { t.p += 1; }
+    if (t.p == s) { err(t, "expected a key"); }
+    return t.src[s..t.p];
+}
+
+fn string(t: *TP) -> []const u8 {
+    if (t.c() != '"') { err(t, "expected a \"string\""); }
+    t.p += 1;
+    var out: text.Buf = .{};
+    while (t.c() != '"') {
+        if (t.c() == 0 || t.c() == '\n') { err(t, "unterminated string"); }
+        if (t.c() == '\\') {
+            t.p += 1;
+            let c = t.c();
+            out.byte(if (c == 'n') '\n' else if (c == 't') '\t' else c);
+            t.p += 1;
+            continue;
+        }
+        out.byte(t.c());
+        t.p += 1;
+    }
+    t.p += 1;
+    return out.items;
+}
+
+fn startsHere(t: *TP, w: []const u8) -> bool { return text.startsWith(t.src[t.p..], w); }
+
+fn value(t: *TP) -> *Value {
+    let v = alloc.new(Value);
+    if (t.c() == '"') {
+        v.k = .Str;
+        v.s = string(t);
+    } else if (t.c() == '[') {
+        v.k = .Arr;
+        t.p += 1;
+        skipAll(t);
+        while (t.c() != ']') {
+            v.arr.push(string(t));
+            skipAll(t);
+            if (t.c() == ',') {
+                t.p += 1;
+                skipAll(t);
+            } else if (t.c() != ']') {
+                err(t, "expected ',' or ']' in the array");
+            }
+        }
+        t.p += 1;
+    } else if (t.c() == '{') {
+        v.k = .Table;
+        t.p += 1;
+        skipWs(t);
+        while (t.c() != '}') {
+            let k = key(t);
+            skipWs(t);
+            if (t.c() != '=') { err(t, text.f("expected '=' after '{s}'", .{k})); }
+            t.p += 1;
+            skipWs(t);
+            v.keys.push(k);
+            v.vals.push(string(t));
+            skipWs(t);
+            if (t.c() == ',') {
+                t.p += 1;
+                skipWs(t);
+            } else if (t.c() != '}') {
+                err(t, "expected ',' or '}' in the inline table");
+            }
+        }
+        t.p += 1;
+    } else if (startsHere(t, "true") || startsHere(t, "false")) {
+        v.k = .Bool;
+        let yes = t.c() == 't';
+        v.i = if (yes) 1 else 0;
+        t.p += if (yes) 4 else 5;
+    } else if ((t.c() >= '0' && t.c() <= '9') || t.c() == '-') {
+        v.k = .Int;
+        var neg = false;
+        if (t.c() == '-') {
+            neg = true;
+            t.p += 1;
+        }
+        var n: i64 = 0;
+        while (t.c() >= '0' && t.c() <= '9') {
+            n = n *% 10 +% (t.c() - '0') as i64;
+            t.p += 1;
+        }
+        v.i = if (neg) 0 -% n else n;
+    } else {
+        err(t, "expected a value: a \"string\", a number, true/false, [array] or { table }");
+    }
+    return v;
+}
+
+// an inline table's value for a key
+pub fn get(v: *Value, k: []const u8) -> ?[]const u8 {
+    for (0..v.keys.items.len) |i| { if (text.eq(v.keys.items[i], k)) { return v.vals.items[i]; } }
+    return null;
+}
+
+// Reads the whole file. A table named twice is one table.
+pub fn parse(file: []const u8, src: []const u8) -> *Doc {
+    let doc = alloc.new(Doc);
+    doc.file = file;
+    var tp = TP { file: file, src: src, p: 0, line: 1 };
+    let t = &tp;
+    var table: ?*Table = null;
+    while (true) {
+        skipAll(t);
+        if (t.c() == 0) { break; }
+        if (t.c() == '[') {
+            t.p += 1;
+            let s = t.p;
+            _ = key(t);
+            while (t.c() == '.') {
+                t.p += 1;
+                _ = key(t);
+            }
+            let name = t.src[s..t.p];
+            if (t.c() != ']') { err(t, "expected ']' after the table name"); }
+            t.p += 1;
+            skipWs(t);
+            if (t.c() != 0 && t.c() != '\n') { err(t, text.f("expected the end of the line after [{s}]", .{name})); }
+            table = null;
+            for (doc.tables.items) |x| { if (text.eq(x.name, name)) { table = x; } }
+            if (table == null) {
+                let nt = alloc.new(Table);
+                nt.name = name;
+                nt.line = t.line;
+                doc.tables.push(nt);
+                table = nt;
+            }
+            continue;
+        }
+        let line = t.line;
+        let k = key(t);
+        skipWs(t);
+        if (t.c() != '=') { err(t, text.f("expected '=' after '{s}'", .{k})); }
+        t.p += 1;
+        skipWs(t);
+        let v = value(t);
+        skipWs(t);
+        if (t.c() != 0 && t.c() != '\n') { err(t, text.f("expected the end of the line after the value of '{s}'", .{k})); }
+        let tb = table orelse bad(file, line, text.f("'{s}' must be inside a table, like [package]", .{k}));
+        for (tb.entries.items) |*e| {
+            if (text.eq(e.key, k)) { bad(file, line, text.f("'{s}' is set twice in [{s}]", .{k, tb.name})); }
+        }
+        tb.entries.push(Entry { key: k, v: v, line: line });
+    }
+    return doc;
+}

@@ -1,0 +1,123 @@
+// base.text - byte strings: comparing, building, and converting to and from C strings.
+//
+// Strings are []const u8 everywhere in flint. Building one allocates from the C heap
+// (see base.alloc: never freed, out of memory ends the compile).
+
+import std.fmt;
+import std.mem;
+import std.heap;
+import base.alloc;
+
+extern fn snprintf(buf: [*]u8, n: usize, f: cstr, ...) -> i32;
+extern fn strtod(s: cstr, end: ?*[*]u8) -> f64;
+extern fn strlen(s: cstr) -> usize;
+
+pub fn eq(a: []const u8, b: []const u8) -> bool { return mem.eql(u8, a, b); }
+
+pub fn startsWith(s: []const u8, p: []const u8) -> bool { return s.len >= p.len && eq(s[0..p.len], p); }
+
+pub fn endsWith(s: []const u8, p: []const u8) -> bool { return s.len >= p.len && eq(s[s.len - p.len..], p); }
+
+// the first index of byte c in s
+pub fn indexOf(s: []const u8, c: u8) -> ?usize {
+    for (0..s.len) |i| { if (s[i] == c) { return i; } }
+    return null;
+}
+
+// the last index of byte c in s
+pub fn lastIndexOf(s: []const u8, c: u8) -> ?usize {
+    var i = s.len;
+    while (i > 0) {
+        i -= 1;
+        if (s[i] == c) { return i; }
+    }
+    return null;
+}
+
+// is `s` one of `set`?
+pub fn oneOf(s: []const u8, set: []const []const u8) -> bool {
+    for (set) |x| { if (eq(s, x)) { return true; } }
+    return false;
+}
+
+// A new string made with a format: text.f("{s}.{s}", .{a, b})
+pub fn f(comptime spec: []const u8, args: anytype) -> []u8 {
+    return fmt.allocPrint(heap.c_allocator, spec, args) catch alloc.oom();
+}
+
+// a + b
+pub fn cat(a: []const u8, b: []const u8) -> []u8 {
+    let out = alloc.make(u8, a.len + b.len);
+    mem.copy(u8, out[0..a.len], a);
+    mem.copy(u8, out[a.len..], b);
+    return out;
+}
+
+// s with a NUL after it, for C
+pub fn z(s: []const u8) -> cstr {
+    let out = alloc.make(u8, s.len + 1);
+    mem.copy(u8, out[0..s.len], s);
+    unsafe { return @ptrCast(cstr, out.ptr); }
+}
+
+// the bytes of a C string (not copied)
+pub fn span(c: cstr) -> []const u8 { return mem.span(c); }
+
+// C's strtod on s (the whole text should be a number; the lexer only hands it digits)
+pub fn parseFloat(s: []const u8) -> f64 { return strtod(z(s), null); }
+
+// printf's "%.*g": how floats appear in IR dumps and messages
+pub fn g(v: f64, prec: i32) -> []u8 {
+    var buf: [64]u8 = undefined;
+    let n = snprintf(&buf, buf.len, "%.*g", prec, v);
+    return alloc.dupe(u8, buf[0..n as usize]);
+}
+
+// printf's "%g"
+pub fn g6(v: f64) -> []u8 { return g(v, 6); }
+
+// A string being built: text.Buf, then .add / .addf, then .items
+pub struct Buf {
+    items: []u8 = mem.Allocator.empty(u8),
+    cap: usize = 0,
+
+    pub fn add(self: *Self, s: []const u8) {
+        let n = self.items.len;
+        if (n + s.len > self.cap) {
+            var nc = if (self.cap == 0) 64 else self.cap * 2;
+            while (nc < n + s.len) { nc *= 2; }
+            let nb = alloc.make(u8, nc);
+            mem.copy(u8, nb[0..n], self.items);
+            self.items = nb[0..n];
+            self.cap = nc;
+        }
+        unsafe { self.items = self.items.ptr[0..n + s.len]; }
+        mem.copy(u8, self.items[n..], s);
+    }
+
+    pub fn byte(self: *Self, c: u8) {
+        let n = self.items.len;
+        if (n == self.cap) {
+            let nc = if (self.cap == 0) 64 else self.cap * 2;
+            let nb = alloc.make(u8, nc);
+            mem.copy(u8, nb[0..n], self.items);
+            self.items = nb[0..n];
+            self.cap = nc;
+        }
+        unsafe { self.items = self.items.ptr[0..n + 1]; }
+        self.items[n] = c;
+    }
+
+    // formatted text, written straight into the buffer
+    pub fn addf(self: *Self, comptime spec: []const u8, args: anytype) {
+        fmt.format(self.writer(), spec, args) catch alloc.oom();
+    }
+
+    pub fn writer(self: *Self) -> fmt.Writer { return fmt.Writer { ctx: self, writeFn: Buf.writeFn }; }
+
+    fn writeFn(ctx: *void, bytes: []const u8) -> !void {
+        var b: *Buf = undefined;
+        unsafe { b = @ptrCast(*Buf, ctx); }
+        b.add(bytes);
+    }
+}

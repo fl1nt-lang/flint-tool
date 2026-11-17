@@ -1,0 +1,154 @@
+// cache - a project's out/ directory, and knowing when what's in it can be used again:
+//
+//   out/<profile>/<name>                 the executable
+//   out/<profile>/cache/<kind>/          kind: main, or test for `flint test`
+//       c/<package>-<hash>.o  .d  .key   a C source's object; key: see cKey   (flint)
+//       prog.s prog.o prog.key link.key  the program and the link              (flintc --cache)
+//
+// There are no timestamps here: a step's key is a hash of everything that goes into it, kept
+// next to its output, and the step is skipped when the key it would write is already there.
+
+import std.fs;
+import std.hash;
+import std.heap;
+import base.alloc;
+import base.text;
+
+extern fn opendir(path: cstr) -> ?*void;
+extern fn readdir(d: *void) -> ?*Dirent;
+extern fn closedir(d: *void) -> i32;
+
+// macOS's struct dirent (64-bit inodes)
+struct Dirent {
+    ino: u64,
+    seekoff: u64,
+    reclen: u16,
+    namlen: u16,
+    kind: u8,
+    name: [1024]u8,
+}
+
+// ---- files and directories ----
+
+// the absolute path, or p itself if it doesn't exist
+pub fn real(p: []const u8) -> []const u8 {
+    var buf: [1024]u8 = undefined;
+    let r = fs.realPath(p, buf[..]) catch return p;
+    return alloc.dupe(u8, r);
+}
+
+pub fn isDir(path: []const u8) -> bool {
+    let d = opendir(text.z(path)) orelse return false;
+    _ = closedir(d);
+    return true;
+}
+
+// the names in a directory (none if it can't be read)
+pub fn list(dir: []const u8) -> []const []const u8 {
+    var out: alloc.Vec([]const u8) = .{};
+    let d = opendir(text.z(dir)) orelse return out.items;
+    while (readdir(d)) |e| {
+        var name: []const u8 = undefined;
+        unsafe { name = e.name[0..e.namlen as usize]; }
+        if (text.eq(name, ".") || text.eq(name, "..")) { continue; }
+        out.push(alloc.dupe(u8, name));
+    }
+    _ = closedir(d);
+    return out.items;
+}
+
+// creates the directory and the ones above it; false if it isn't there afterwards
+pub fn makeDirs(path: []const u8) -> bool {
+    for (1..path.len) |i| {
+        if (path[i] == '/') { fs.makeDir(path[0..i]) catch {}; }
+    }
+    fs.makeDir(path) catch {};
+    return isDir(path);
+}
+
+// Removes a file, or a directory and everything in it. A symbolic link is removed, not followed.
+pub fn removeTree(path: []const u8) {
+    fs.remove(path) catch {
+        for (list(path)) |name| { removeTree(text.f("{s}/{s}", .{path, name})); }
+        fs.removeDir(path) catch {};
+    };
+}
+
+// ---- the layout ----
+
+pub fn outDir(pkg_dir: []const u8) -> []const u8 { return text.f("{s}/out", .{pkg_dir}); }
+
+pub fn profileDir(pkg_dir: []const u8, profile: []const u8) -> []const u8 {
+    return text.f("{s}/out/{s}", .{pkg_dir, profile});
+}
+
+pub fn stepDir(pkg_dir: []const u8, profile: []const u8, kind: []const u8) -> []const u8 {
+    return text.f("{s}/out/{s}/cache/{s}", .{pkg_dir, profile, kind});
+}
+
+// ---- keys ----
+
+pub fn mix(h: u64, bytes: []const u8) -> u64 { return hash.int(h ^ hash.bytes(bytes)); }
+
+pub fn hex(h: u64) -> []const u8 { return text.f("{x}", .{h}); }
+
+// the key of a list of strings (a command line)
+pub fn ofStrings(xs: []const []const u8) -> u64 {
+    var h: u64 = 0;
+    for (xs) |x| { h = mix(h, x); }
+    return h;
+}
+
+// the key written at path ("" if there's none)
+pub fn read(path: []const u8) -> []const u8 {
+    return fs.readFile(heap.c_allocator, path) catch return "";
+}
+
+pub fn write(path: []const u8, key: []const u8) {
+    fs.writeFile(path, key) catch {};
+}
+
+// The files a C compiler's dependency file (-MMD) lists: `target: a.c a.h \` and so on.
+fn depFiles(d: []const u8) -> []const []const u8 {
+    var out: alloc.Vec([]const u8) = .{};
+    var i = text.indexOf(d, ':') orelse return out.items;
+    i += 1;
+    var cur: text.Buf = .{};
+    while (i <= d.len) {
+        let c: u8 = if (i < d.len) d[i] else '\n';
+        if (c == '\\' && i + 1 < d.len && d[i + 1] == '\n') { // the line goes on
+            i += 2;
+            continue;
+        }
+        if (c == '\\' && i + 1 < d.len && d[i + 1] == ' ') { // a space in a name
+            cur.byte(' ');
+            i += 2;
+            continue;
+        }
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+            if (cur.items.len > 0) {
+                out.push(cur.items);
+                cur = .{};
+            }
+        } else {
+            cur.byte(c);
+        }
+        i += 1;
+    }
+    return out.items;
+}
+
+// A C object's key: the command that makes it, and the contents of the source and of every
+// header it included (they are in its dependency file). "" when that can't be known: the
+// dependency file is missing, or one of the files in it is.
+pub fn cKey(argv: []const []const u8, dfile: []const u8) -> []const u8 {
+    let d = fs.readFile(heap.c_allocator, dfile) catch return "";
+    let files = depFiles(d);
+    if (files.len == 0) { return ""; }
+    var h = ofStrings(argv);
+    for (files) |file| {
+        let bytes = fs.readFile(heap.c_allocator, file) catch return "";
+        h = mix(mix(h, file), bytes);
+    }
+    return hex(h);
+}
